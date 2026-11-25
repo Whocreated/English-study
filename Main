@@ -1,0 +1,371 @@
+import json
+import os
+import random
+import re
+from collections import defaultdict
+from pypdf import PdfReader
+
+WRONG_WORDS_FILE = "wrong_words.txt"
+REQUIRED_CORRECT_COUNT = 2  # 錯題本需累計答對幾次才移除
+
+def extract_text_from_pdf(pdf_path):
+    """讀取 PDF 內所有文字並合併"""
+    reader = PdfReader(pdf_path)
+    full_text = []
+    for page in reader.pages:
+        text = page.extract_text()
+        if text:
+            full_text.append(text)
+    return "\n".join(full_text)
+
+def split_text_by_levels(raw_text):
+    """依據標題「大考中心字彙表 LEVEL X」切分為 6 個 Level"""
+    level_texts = {}
+    header_pattern = re.compile(r'大考中心字彙表\s*LEVEL\s*(\d+)\s*\([\d,]+\s*words\)')
+    matches = list(header_pattern.finditer(raw_text))
+
+    for idx, match in enumerate(matches):
+        level_num = int(match.group(1))
+        start_pos = match.end()
+        end_pos = matches[idx + 1].start() if idx + 1 < len(matches) else len(raw_text)
+        level_texts[level_num] = raw_text[start_pos:end_pos]
+
+    return level_texts
+
+def parse_selected_levels(level_texts, selected_levels):
+    """解析指定 Level 範圍，合併同義詞並保留 KK 音標與詞性"""
+    combined_text = " ".join([level_texts[lvl] for lvl in selected_levels if lvl in level_texts])
+    clean_text = re.sub(r'\s+', ' ', combined_text)
+
+    pattern = re.compile(
+        r'([a-zA-Z][a-zA-Z0-9\s/().\'-]{0,35}?)\s*'
+        r'(\[[^\]]+\](?:\s*/\s*\[[^\]]+\])*)\s*'
+        r'(.*?)(?=\s+[a-zA-Z][a-zA-Z0-9\s/().\'-]{0,35}?\s*\[[^\]]+\]|$)'
+    )
+
+    grouped = defaultdict(list)
+    word_details = {}
+    pos_pattern = re.compile(
+        r'\b(?:n|v|vt|vi|adj|adv|prep|conj|pron|art|aux|int|a)\b\.?',
+        re.IGNORECASE
+    )
+
+    for match in pattern.finditer(clean_text):
+        eng_raw = match.group(1).strip()
+        kk_raw = match.group(2).strip()
+        chi_raw = match.group(3).strip()
+
+        eng_clean_match = re.search(r'([a-zA-Z][a-zA-Z0-9\s/().\'-]*)$', eng_raw)
+        if not eng_clean_match:
+            continue
+        eng_raw = eng_clean_match.group(1).strip()
+
+        eng_variants = []
+        for variant in eng_raw.split('/'):
+            v = re.sub(r'\(\d+\)', '', variant)
+            v = re.sub(r'\([a-zA-Z]+\)', '', v).strip()
+            if v and re.match(r'^[a-zA-Z][a-zA-Z\s.\'-]*$', v):
+                eng_variants.append(v.lower())
+
+        if not eng_variants or not chi_raw:
+            continue
+
+        for v in eng_variants:
+            if v not in word_details:
+                word_details[v] = {
+                    "display": eng_raw,
+                    "kk": kk_raw,
+                    "chi": chi_raw
+                }
+            elif chi_raw not in word_details[v]["chi"]:
+                word_details[v]["chi"] += f" | {chi_raw}"
+
+        chi_for_split = re.sub(r'\(\d+\)', ';', chi_raw)
+        chi_for_split = pos_pattern.sub(' ', chi_for_split)
+        meanings = re.split(r'[;；、,，]', chi_for_split)
+
+        for m in meanings:
+            m_clean = m.strip()
+            m_clean = re.sub(r'^\([^\)]+\)\s*', '', m_clean).strip()
+            if len(m_clean) >= 1 and re.search(r'[\u4e00-\u9fff]', m_clean):
+                for v in eng_variants:
+                    if v not in grouped[m_clean]:
+                        grouped[m_clean].append(v)
+
+    quiz_data = [(eng_list, chi) for chi, eng_list in grouped.items()]
+    return quiz_data, word_details
+
+# ================= 錯題本讀寫管理模組（含累計答對次數追蹤） =================
+
+def load_wrong_book(filepath=WRONG_WORDS_FILE):
+    """從 wrong_words.txt 讀取既有錯題"""
+    if not os.path.exists(filepath):
+        return {}, {}
+
+    wrong_map = {}
+    details_map = {}
+
+    with open(filepath, "r", encoding="utf-8") as f:
+        for line in f:
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                record = json.loads(line)
+                chi = record["chi"]
+                wrong_map[chi] = {
+                    "eng_list": record["eng_list"],
+                    "streak": record.get("streak", 0)
+                }
+                for w, info in record["details"].items():
+                    details_map[w] = info
+            except (json.JSONDecodeError, KeyError):
+                continue
+
+    return wrong_map, details_map
+
+def save_wrong_book(wrong_map, details_map, filepath=WRONG_WORDS_FILE):
+    """將最新錯題本與累計答對進度寫回 wrong_words.txt"""
+    with open(filepath, "w", encoding="utf-8") as f:
+        for chi, data in wrong_map.items():
+            eng_list = data["eng_list"]
+            record = {
+                "chi": chi,
+                "eng_list": eng_list,
+                "streak": data.get("streak", 0),
+                "details": {w: details_map[w] for w in eng_list if w in details_map}
+            }
+            f.write(json.dumps(record, ensure_ascii=False) + "\n")
+
+def add_or_reset_wrong_book(new_wrong_items, word_details, filepath=WRONG_WORDS_FILE):
+    """將本次答錯的題目加入錯題本；若原本已在錯題本內，答對次數歸零"""
+    if not new_wrong_items:
+        return
+    wrong_map, details_map = load_wrong_book(filepath)
+    for eng_list, chi in new_wrong_items:
+        wrong_map[chi] = {
+            "eng_list": eng_list,
+            "streak": 0
+        }
+        for w in eng_list:
+            if w in word_details:
+                details_map[w] = word_details[w]
+    save_wrong_book(wrong_map, details_map, filepath)
+
+def update_wrong_book_progress(correct_chis, filepath=WRONG_WORDS_FILE):
+    """錯題複習模式中，更新答對題目的累計次數，達標則移除"""
+    if not correct_chis:
+        return [], []
+
+    wrong_map, details_map = load_wrong_book(filepath)
+    graduated = []
+    progressed = []
+
+    for chi in correct_chis:
+        if chi in wrong_map:
+            new_streak = wrong_map[chi].get("streak", 0) + 1
+            if new_streak >= REQUIRED_CORRECT_COUNT:
+                wrong_map.pop(chi)
+                graduated.append(chi)
+            else:
+                wrong_map[chi]["streak"] = new_streak
+                progressed.append((chi, new_streak))
+
+    save_wrong_book(wrong_map, details_map, filepath)
+    return graduated, progressed
+
+# ==============================================================================
+
+def get_level_selection():
+    """讓使用者輸入要測驗的 Level"""
+    while True:
+        user_input = input("請選擇要考的 Level（例如 3-6、1,3,5，直接按 Enter 為全範圍 1-6）：").strip()
+        if not user_input:
+            return [1, 2, 3, 4, 5, 6]
+
+        selected = set()
+        valid = True
+        for part in user_input.split(','):
+            part = part.strip()
+            if '-' in part:
+                bounds = part.split('-')
+                if len(bounds) == 2 and bounds[0].isdigit() and bounds[1].isdigit():
+                    start, end = int(bounds[0]), int(bounds[1])
+                    if 1 <= start <= end <= 6:
+                        selected.update(range(start, end + 1))
+                        continue
+                valid = False
+            elif part.isdigit() and 1 <= int(part) <= 6:
+                selected.add(int(part))
+            else:
+                valid = False
+
+        if valid and selected:
+            return sorted(selected)
+        print("⚠️ 格式錯誤，請輸入 1 到 6 之間的數字、區間（如 3-6）或逗號分隔（如 2,4,6）。")
+
+def make_hint(word):
+    """產生學測文意字彙風格的首尾字母與字數提示"""
+    if len(word) <= 2:
+        return f"{word[0]} _ (共 {len(word)} 字母)"
+    return f"{word[0]} {'_ ' * (len(word) - 2)}{word[-1]} (共 {len(word)} 字母)"
+
+def format_word_info(word, word_details):
+    """格式化輸出：單字 [KK音標] 詞性與完整解釋"""
+    info = word_details[word]
+    return f"{info['display']} {info['kk']} {info['chi']}"
+
+def format_answers(eng_list, word_details):
+    """串接多個同義詞資訊"""
+    return "\n      • ".join([format_word_info(w, word_details) for w in eng_list])
+
+def run_quiz(word_list, word_details, scope_label, num_questions=10, use_hint=False, is_wrong_book_mode=False, wrong_streaks=None):
+    count = min(num_questions, len(word_list))
+    questions = random.sample(word_list, count)
+    
+    score = 0
+    session_wrong_records = []
+    wrong_items_to_save = []
+    correct_chis_in_wrong_mode = []
+
+    mode_text = "【學測字彙提示模式：鎖定單一單字】" if use_hint else "【同義詞寬鬆模式：任一同義詞皆可】"
+    
+    print(f"\n=== 學測英文單字測驗 ===")
+    print(f"測驗範圍：{scope_label}（題庫共 {len(word_list)} 題，本次測驗 {count} 題）")
+    print(f"{mode_text}\n")
+
+    for i, (eng_list, chi) in enumerate(questions, 1):
+        streak_badge = ""
+        if is_wrong_book_mode and wrong_streaks is not None:
+            cur_s = wrong_streaks.get(chi, 0)
+            streak_badge = f" [目前進度：{cur_s}/{REQUIRED_CORRECT_COUNT}]"
+
+        print(f"第 {i} 題：{chi}{streak_badge}")
+
+        if use_hint:
+            target_word = random.choice(eng_list)
+            print(f"提示：{make_hint(target_word)}")
+            ans = input("請輸入英文單字：").strip().lower()
+
+            if ans == target_word:
+                others = [w for w in eng_list if w != target_word]
+                extra = f"\n   其他同義詞：\n      • {format_answers(others, word_details)}" if others else ""
+                print(f"✅ 答對了！{format_word_info(target_word, word_details)}{extra}\n")
+                score += 1
+                if is_wrong_book_mode:
+                    correct_chis_in_wrong_mode.append(chi)
+            else:
+                correct_info = format_word_info(target_word, word_details)
+                print(f"❌ 答錯了！正確答案是：{correct_info}\n")
+                session_wrong_records.append((correct_info, chi, ans))
+                wrong_items_to_save.append((eng_list, chi))
+        else:
+            ans = input("請輸入英文單字：").strip().lower()
+
+            if ans in eng_list:
+                others = [w for w in eng_list if w != ans]
+                extra = f"\n   其他同義詞：\n      • {format_answers(others, word_details)}" if others else ""
+                print(f"✅ 答對了！{format_word_info(ans, word_details)}{extra}\n")
+                score += 1
+                if is_wrong_book_mode:
+                    correct_chis_in_wrong_mode.append(chi)
+            else:
+                all_ans_info = format_answers(eng_list, word_details)
+                print(f"❌ 答錯了！可接受的答案：\n      • {all_ans_info}\n")
+                session_wrong_records.append((all_ans_info.replace("\n      • ", " / "), chi, ans))
+                wrong_items_to_save.append((eng_list, chi))
+
+    print("==================================")
+    print(f"測驗結束！你的得分：{score} / {count}")
+
+    # 1. 處理答錯的單字
+    if wrong_items_to_save:
+        add_or_reset_wrong_book(wrong_items_to_save, word_details)
+        reset_note = "（答對次數已歸零）" if is_wrong_book_mode else ""
+        print(f"💾 已將本次答錯的 {len(wrong_items_to_save)} 題寫入 {WRONG_WORDS_FILE}！{reset_note}")
+
+    # 2. 處理錯題本複習答對的進度更新
+    if is_wrong_book_mode and correct_chis_in_wrong_mode:
+        graduated, progressed = update_wrong_book_progress(correct_chis_in_wrong_mode)
+        if progressed:
+            print(f"📈 進度推進（累計答對 1/{REQUIRED_CORRECT_COUNT} 次，再對 1 次即可移除）：")
+            for chi, s in progressed:
+                print(f"   • {chi}")
+        if graduated:
+            print(f"🎓 恭喜完全掌握（累計答對 {REQUIRED_CORRECT_COUNT}/{REQUIRED_CORRECT_COUNT} 次），已從錯題本移除：")
+            for chi in graduated:
+                print(f"   • {chi}")
+
+    if session_wrong_records:
+        print("\n【本輪錯題複習】")
+        for correct_info, chi, user_ans in session_wrong_records:
+            print(f"- 題目「{chi}」 | 正解：{correct_info} | 你的答案：{user_ans}")
+
+def main():
+    pdf_filename = "大考中心詞彙表 Level 1-6.pdf"
+    cached_level_texts = None  # 快取 PDF 解析結果，避免重複讀取耗時
+
+    while True:
+        # 每次回到主選單時，重新讀取最新的錯題數量
+        wrong_map, wrong_details = load_wrong_book()
+        wrong_count = len(wrong_map)
+
+        print("\n==================================")
+        print("=== 學測英文單字測驗主選單 ===")
+        print("1. 一般測驗（從大考中心 PDF 自選 Level 1-6）")
+        print(f"2. 專門考錯題本（目前累積 {wrong_count} 題錯題，需累計答對 {REQUIRED_CORRECT_COUNT} 次才移除）")
+        print("q. 離開程式")
+        print("==================================")
+
+        mode_choice = input("請輸入選項 (1 / 2 / q)：").strip().lower()
+
+        if mode_choice == "q":
+            print("\n👋 測驗結束，祝學測英文順利拿滿級分！")
+            break
+
+        if mode_choice == "2":
+            if wrong_count == 0:
+                print(f"\n⚠️ 目前 {WRONG_WORDS_FILE} 裡面還沒有任何錯題喔！請先選擇 1 進行一般測驗。")
+                continue
+            words = [(data["eng_list"], chi) for chi, data in wrong_map.items()]
+            streaks = {chi: data["streak"] for chi, data in wrong_map.items()}
+            details = wrong_details
+            scope = "錯題本複習 (wrong_words.txt)"
+            is_wrong_mode = True
+        elif mode_choice == "1" or mode_choice == "":
+            # 第一次選擇一般測驗時才讀取 PDF，之後直接使用記憶體快取
+            if cached_level_texts is None:
+                print("\n正在讀取 PDF 單字庫（僅首次載入需稍候）...")
+                raw_text = extract_text_from_pdf(pdf_filename)
+                cached_level_texts = split_text_by_levels(raw_text)
+
+            levels = get_level_selection()
+            words, details = parse_selected_levels(cached_level_texts, levels)
+            streaks = None
+            scope = ", ".join([f"Level {lvl}" for lvl in levels])
+            is_wrong_mode = False
+        else:
+            print("⚠️ 無效的選項，請輸入 1、2 或 q。")
+            continue
+
+        hint_choice = input("是否開啟學測「首尾字母＋字數提示」？(y/n)：").strip().lower()
+        enable_hint = (hint_choice == "y")
+
+        run_quiz(
+            words,
+            details,
+            scope_label=scope,
+            num_questions=10,
+            use_hint=enable_hint,
+            is_wrong_book_mode=is_wrong_mode,
+            wrong_streaks=streaks
+        )
+
+        # 一輪結束後的快速操作提示
+        next_step = input("\n按 Enter 鍵返回主選單繼續測驗，或輸入 q 離開程式：").strip().lower()
+        if next_step == "q":
+            print("\n👋 測驗結束，祝學測英文順利拿滿級分！")
+            break
+
+if __name__ == "__main__":
+    main()
