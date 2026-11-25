@@ -5,7 +5,10 @@ import re
 from collections import defaultdict
 from pypdf import PdfReader
 
-WRONG_WORDS_FILE = "wrong_words.txt"
+# 自動鎖定 1.py 所在的資料夾 (d:\vscode\english)
+BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+PDF_FILE = os.path.join(BASE_DIR, "大考中心詞彙表 Level 1-6.pdf")
+WRONG_WORDS_FILE = os.path.join(BASE_DIR, "wrong_words.txt")
 REQUIRED_CORRECT_COUNT = 2  # 錯題本需累計答對幾次才移除
 
 def extract_text_from_pdf(pdf_path):
@@ -224,6 +227,8 @@ def run_quiz(word_list, word_details, scope_label, num_questions=10, use_hint=Fa
     questions = random.sample(word_list, count)
     
     score = 0
+    answered_count = 0  # 追蹤實際已作答題數（支援中途退出）
+    aborted = False
     session_wrong_records = []
     wrong_items_to_save = []
     correct_chis_in_wrong_mode = []
@@ -232,7 +237,8 @@ def run_quiz(word_list, word_details, scope_label, num_questions=10, use_hint=Fa
     
     print(f"\n=== 學測英文單字測驗 ===")
     print(f"測驗範圍：{scope_label}（題庫共 {len(word_list)} 題，本次測驗 {count} 題）")
-    print(f"{mode_text}\n")
+    print(f"{mode_text}")
+    print("💡 提示：作答過程中隨時輸入 q 可中途結束並結算目前進度\n")
 
     for i, (eng_list, chi) in enumerate(questions, 1):
         streak_badge = ""
@@ -245,8 +251,15 @@ def run_quiz(word_list, word_details, scope_label, num_questions=10, use_hint=Fa
         if use_hint:
             target_word = random.choice(eng_list)
             print(f"提示：{make_hint(target_word)}")
-            ans = input("請輸入英文單字：").strip().lower()
+            ans = input("請輸入英文單字（或輸入 q 退出）：").strip().lower()
 
+            # 檢查是否中途退出
+            if ans in ("q", "quit"):
+                print("\n⏹️ 已中途結束本輪測驗，正在結算已作答題目...")
+                aborted = True
+                break
+
+            answered_count += 1
             if ans == target_word:
                 others = [w for w in eng_list if w != target_word]
                 extra = f"\n   其他同義詞：\n      • {format_answers(others, word_details)}" if others else ""
@@ -260,8 +273,15 @@ def run_quiz(word_list, word_details, scope_label, num_questions=10, use_hint=Fa
                 session_wrong_records.append((correct_info, chi, ans))
                 wrong_items_to_save.append((eng_list, chi))
         else:
-            ans = input("請輸入英文單字：").strip().lower()
+            ans = input("請輸入英文單字（或輸入 q 退出）：").strip().lower()
 
+            # 檢查是否中途退出
+            if ans in ("q", "quit"):
+                print("\n⏹️ 已中途結束本輪測驗，正在結算已作答題目...")
+                aborted = True
+                break
+
+            answered_count += 1
             if ans in eng_list:
                 others = [w for w in eng_list if w != ans]
                 extra = f"\n   其他同義詞：\n      • {format_answers(others, word_details)}" if others else ""
@@ -276,15 +296,18 @@ def run_quiz(word_list, word_details, scope_label, num_questions=10, use_hint=Fa
                 wrong_items_to_save.append((eng_list, chi))
 
     print("==================================")
-    print(f"測驗結束！你的得分：{score} / {count}")
+    if answered_count == 0:
+        print("本次尚未作答任何題目，直接返回主選單。")
+        return
 
-    # 1. 處理答錯的單字
+    status_label = "測驗中途結束！" if aborted else "測驗結束！"
+    print(f"{status_label} 你的得分：{score} / {answered_count}")
+
     if wrong_items_to_save:
         add_or_reset_wrong_book(wrong_items_to_save, word_details)
         reset_note = "（答對次數已歸零）" if is_wrong_book_mode else ""
-        print(f"💾 已將本次答錯的 {len(wrong_items_to_save)} 題寫入 {WRONG_WORDS_FILE}！{reset_note}")
+        print(f"💾 已將本次答錯的 {len(wrong_items_to_save)} 題寫入 wrong_words.txt！{reset_note}")
 
-    # 2. 處理錯題本複習答對的進度更新
     if is_wrong_book_mode and correct_chis_in_wrong_mode:
         graduated, progressed = update_wrong_book_progress(correct_chis_in_wrong_mode)
         if progressed:
@@ -302,11 +325,9 @@ def run_quiz(word_list, word_details, scope_label, num_questions=10, use_hint=Fa
             print(f"- 題目「{chi}」 | 正解：{correct_info} | 你的答案：{user_ans}")
 
 def main():
-    pdf_filename = "大考中心詞彙表 Level 1-6.pdf"
     cached_level_texts = None  # 快取 PDF 解析結果，避免重複讀取耗時
 
     while True:
-        # 每次回到主選單時，重新讀取最新的錯題數量
         wrong_map, wrong_details = load_wrong_book()
         wrong_count = len(wrong_map)
 
@@ -325,7 +346,7 @@ def main():
 
         if mode_choice == "2":
             if wrong_count == 0:
-                print(f"\n⚠️ 目前 {WRONG_WORDS_FILE} 裡面還沒有任何錯題喔！請先選擇 1 進行一般測驗。")
+                print("\n⚠️ 目前 wrong_words.txt 裡面還沒有任何錯題喔！請先選擇 1 進行一般測驗。")
                 continue
             words = [(data["eng_list"], chi) for chi, data in wrong_map.items()]
             streaks = {chi: data["streak"] for chi, data in wrong_map.items()}
@@ -333,10 +354,19 @@ def main():
             scope = "錯題本複習 (wrong_words.txt)"
             is_wrong_mode = True
         elif mode_choice == "1" or mode_choice == "":
-            # 第一次選擇一般測驗時才讀取 PDF，之後直接使用記憶體快取
             if cached_level_texts is None:
+                target_pdf = PDF_FILE
+                if not os.path.exists(target_pdf):
+                    pdfs = [f for f in os.listdir(BASE_DIR) if f.lower().endswith(".pdf")]
+                    if pdfs:
+                        target_pdf = os.path.join(BASE_DIR, pdfs[0])
+                        print(f"\n自動偵測到 PDF 檔案：{pdfs[0]}")
+                    else:
+                        print(f"\n❌ 在 {BASE_DIR} 找不到任何 PDF 檔案，請確認檔案位置。")
+                        break
+
                 print("\n正在讀取 PDF 單字庫（僅首次載入需稍候）...")
-                raw_text = extract_text_from_pdf(pdf_filename)
+                raw_text = extract_text_from_pdf(target_pdf)
                 cached_level_texts = split_text_by_levels(raw_text)
 
             levels = get_level_selection()
@@ -361,7 +391,6 @@ def main():
             wrong_streaks=streaks
         )
 
-        # 一輪結束後的快速操作提示
         next_step = input("\n按 Enter 鍵返回主選單繼續測驗，或輸入 q 離開程式：").strip().lower()
         if next_step == "q":
             print("\n👋 測驗結束，祝學測英文順利拿滿級分！")
